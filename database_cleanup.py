@@ -7,8 +7,7 @@ cursor = conn.cursor()
 
 cursor.execute("""
     DELETE FROM articles
-    WHERE image_url IS NULL
-       OR TRIM(image_url) = ''
+    WHERE SUMMARY = 'Failed to generate summary automatically.'
 """)
 
 print(f"Deleted {cursor.rowcount} articles.")
