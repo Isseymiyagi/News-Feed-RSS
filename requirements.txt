@@ -1,0 +1,7 @@
+groq
+feedparser
+streamlit
+folium
+streamlit-folium
+requests
+os
