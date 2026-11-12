@@ -2,8 +2,8 @@ name: Automated News Ingestion
 
 on:
   schedule:
-    # Runs automatically 3 times a day (at 00:00, 08:00, and 16:00 UTC)
-    - cron: '0 */8 * * *'
+    # Runs automatically 6 times a day (at 00:00, 04:00, 08:00, 12:00, 16:00, and 20:00 UTC)
+    - cron: '0 */4 * * *'
   workflow_dispatch: # Lets you click a button on GitHub to test it manually anytime!
 
 permissions:

@@ -151,24 +151,30 @@ where_clause = " AND ".join(conditions)
 
 with sqlite3.connect(DB_PATH) as conn:
     total_articles = conn.execute(
-        f"SELECT COUNT(*) FROM articles WHERE {where_clause}", params
-    ).fetchone()[0]
-
+    f"""
+    SELECT COUNT(*)
+    FROM articles
+    WHERE processing_status = 'completed'
+      AND ({where_clause})
+    """,
+    params
+).fetchone()[0]
     total_pages = max(1, (total_articles + PAGE_SIZE - 1) // PAGE_SIZE)
     st.session_state.feed_page = min(st.session_state.feed_page, total_pages - 1)
     page = st.session_state.feed_page
 
-    articles = conn.execute(
-        f"""
-        SELECT title, source, summary, timestamp, country_code,
-               link_url, topic_tag, image_url
-        FROM articles
-        WHERE {where_clause}
-        ORDER BY timestamp DESC, id DESC
-        LIMIT ? OFFSET ?
-        """,
-        [*params, PAGE_SIZE, page * PAGE_SIZE],
-    ).fetchall()
+articles = conn.execute(
+    f"""
+    SELECT title, source, summary, timestamp, country_code,
+           link_url, topic_tag, image_url
+    FROM articles
+    WHERE processing_status = 'completed'
+      AND ({where_clause})
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ? OFFSET ?
+    """,
+    [*params, PAGE_SIZE, page * PAGE_SIZE],
+).fetchall()
 
 if not articles:
     st.info("No matching briefings found for these filters.")
