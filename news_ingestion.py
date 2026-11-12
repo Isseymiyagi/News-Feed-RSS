@@ -17,7 +17,7 @@ import os
 # CONFIGURATION & SOURCES
 # ==========================================
 DB_NAME = "news_vault.db"
-MAX_ENTRIES_PER_FEED = 3
+MAX_ENTRIES_PER_FEED = 50
 
 # ==========================================
 # STAGE 5: DATABASE SETUP
