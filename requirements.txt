@@ -1,6 +1,9 @@
-groq
-feedparser
 streamlit
 folium
 streamlit-folium
+branca
+feedparser
+groq
+openai
+pandas
 requests
