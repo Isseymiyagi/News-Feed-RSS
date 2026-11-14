@@ -7,7 +7,8 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 import traceback
 import feedparser
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, BadRequestError
+from openai import OpenAI, RateLimitError as DeepInfraRateLimitError, APIStatusError as DeepInfraAPIStatusError, APIConnectionError as DeepInfraConnectionError, APITimeoutError as DeepInfraTimeoutError
 import time
 from email.utils import parsedate_to_datetime
 from datetime import timezone
@@ -20,7 +21,12 @@ import os
 # CONFIGURATION & SOURCES
 # ==========================================
 DB_NAME = "news_vault.db"
-MAX_ENTRIES_PER_FEED = 50
+MAX_ENTRIES_PER_FEED = 50  # Number of RSS items considered per source, NOT processing capacity.
+MAX_PROCESSING_MINUTES = 30  # Maximum LLM processing time for one workflow run.
+MAX_ARTICLES_PER_RUN = 600   # Safety ceiling; the time/API budget usually limits throughput.
+MAX_COOLDOWN_WAIT_SECONDS = 120  # Wait for brief 429 cooldowns, not daily exhaustion.
+DEEPINFRA_DAILY_ESTIMATED_BUDGET_USD = 0.50  # Local estimated usage ceiling, not a provider-enforced spend limit.
+DEEPINFRA_MAX_OUTPUT_TOKENS = 1024
 
 # ==========================================
 # STAGE 5: DATABASE SETUP
@@ -64,40 +70,56 @@ def initialize_database():
         WHERE processing_status = 'processing'
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_queue ON articles(processing_status, next_attempt_at, id)")
+    # Persistent estimate ledger survives scheduled runs, to avoid unbounded paid overflow.
+    conn.execute("""CREATE TABLE IF NOT EXISTS paid_inference_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        charged_utc_date TEXT NOT NULL,
+        article_id INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        reserved_usd REAL NOT NULL,
+        actual_usd REAL,
+        created_at TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_paid_inference_day ON paid_inference_ledger(charged_utc_date)")
     conn.commit()
     return conn
 
 
 # ==========================================
-# STAGE 4: GROQ LLM WITH AUTOMATIC MODEL FALLBACK
+# STAGE 4: GROQ PRIMARY; DEEPINFRA PAID OVERFLOW
 # ==========================================
-# All models must support response_format={"type": "json_object"}.
 GROQ_MODELS = [
-    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
 ]
-
-# Remember rate-limited models throughout this ingestion process.
+DEEPINFRA_MODEL = "openai/gpt-oss-120b"
+DEEPINFRA_INPUT_PRICE_PER_MILLION = 0.037
+DEEPINFRA_OUTPUT_PRICE_PER_MILLION = 0.17
+MODEL_ORDER = [f"groq/{m}" for m in GROQ_MODELS] + [f"deepinfra/{DEEPINFRA_MODEL}"]
 model_cooldowns = {}
 
-client = Groq(
-    api_key=os.environ.get("GROQ_API_KEY"),
+groq_key = os.environ.get("GROQ_API_KEY")
+deepinfra_key = os.environ.get("DEEPINFRA_API_KEY")
+groq_client = Groq(api_key=groq_key, max_retries=0) if groq_key else None
+deepinfra_client = OpenAI(
+    api_key=deepinfra_key,
+    base_url="https://api.deepinfra.com/v1/openai",
     max_retries=0,
-)
+    timeout=40,
+) if deepinfra_key else None
 
 class AllModelsUnavailable(Exception):
-    """No configured Groq model can process the article right now."""
+    """No currently available provider successfully processed this article."""
 
-
-def retry_after_seconds(error):
-    """Read Groq's Retry-After header (seconds or HTTP date)."""
+def retry_after_seconds(error, default=60.0):
     response = getattr(error, "response", None)
-    header = response.headers.get("retry-after") if response is not None else None
+    headers = getattr(response, "headers", None)
+    header = headers.get("retry-after") if headers else None
     if header:
         try:
             return max(1.0, float(header))
-        except ValueError:
+        except (ValueError, TypeError):
             try:
                 retry_time = parsedate_to_datetime(header)
                 if retry_time.tzinfo is None:
@@ -105,83 +127,155 @@ def retry_after_seconds(error):
                 return max(1.0, retry_time.timestamp() - time.time())
             except (ValueError, TypeError, OverflowError):
                 pass
-    return 60.0  # Conservative fallback when Groq omits Retry-After.
+    return default
 
+def parse_article_json(text, model):
+    if not text:
+        raise ValueError(f"Empty JSON response from {model}")
+    result = json.loads(text)
+    if not isinstance(result, dict):
+        raise ValueError("JSON response is not an object")
+    summary, country, topic = (result.get(k) for k in ("summary", "country_code", "topic"))
+    allowed = {"Sports", "Business", "Economics", "Finance", "Technology", "Conflict", "Culture", "General"}
+    if not all(isinstance(value, str) and value.strip() for value in (summary, country, topic)):
+        raise ValueError("Missing summary, country_code, or topic")
+    topic = topic.strip().capitalize()
+    country = country.strip().upper()
+    if topic not in allowed:
+        raise ValueError(f"Invalid topic: {topic}")
+    if not re.fullmatch(r"[A-Z]{3}|GLOBAL", country):
+        raise ValueError(f"Invalid ISO country code: {country}")
+    return summary.strip(), country, topic
 
-def query_local_llm(title, content):
-    """Summarize and categorize an article, switching models on 429 errors."""
-    truncated_content = content[:3000]
+def estimate_deepinfra_reservation(messages):
+    # Conservative *estimate*, not a guaranteed token/spend cap. Reserve in
+    # advance; the model may use more input tokens than this estimate.
+    input_chars = sum(len(m["content"]) for m in messages)
+    input_tokens = max(2000, (input_chars + 2) // 3 + 300)
+    return (input_tokens * DEEPINFRA_INPUT_PRICE_PER_MILLION +
+            DEEPINFRA_MAX_OUTPUT_TOKENS * DEEPINFRA_OUTPUT_PRICE_PER_MILLION) / 1_000_000
+
+def deepinfra_budget_available(conn, estimate):
+    today = datetime.now(timezone.utc).date().isoformat()
+    spent = conn.execute("""
+        SELECT COALESCE(SUM(COALESCE(actual_usd, reserved_usd)), 0)
+        FROM paid_inference_ledger WHERE charged_utc_date = ?
+    """, (today,)).fetchone()[0]
+    return spent + estimate <= DEEPINFRA_DAILY_ESTIMATED_BUDGET_USD
+
+def reserve_deepinfra(conn, article_id, estimate):
+    if not deepinfra_budget_available(conn, estimate):
+        return None
+    now = datetime.now(timezone.utc)
+    cursor = conn.execute("""
+        INSERT INTO paid_inference_ledger
+            (charged_utc_date, article_id, model, reserved_usd, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (now.date().isoformat(), article_id, DEEPINFRA_MODEL, estimate, now.isoformat()))
+    conn.commit()
+    return cursor.lastrowid
+
+def record_deepinfra_usage(conn, ledger_id, completion):
+    usage = getattr(completion, "usage", None)
+    if not usage:
+        return
+    # DeepInfra may provide estimated_cost; fall back to token-based pricing.
+    cost = getattr(usage, "estimated_cost", None)
+    if cost is None:
+        inp = getattr(usage, "prompt_tokens", None)
+        out = getattr(usage, "completion_tokens", None)
+        if inp is None or out is None:
+            return
+        cost = (inp * DEEPINFRA_INPUT_PRICE_PER_MILLION +
+                out * DEEPINFRA_OUTPUT_PRICE_PER_MILLION) / 1_000_000
+    conn.execute("UPDATE paid_inference_ledger SET actual_usd = ? WHERE id = ?",
+                 (float(cost), ledger_id))
+    conn.commit()
+    print(f"   💵 DeepInfra estimated request cost: ${float(cost):.6f}")
+
+def query_local_llm(title, content, conn, article_id):
+    """Use Groq capacity first; DeepInfra handles overflow without losing rows."""
     prompt = f"""
-    You are an AI intelligence agent sorting global news.
-    Analyze this news item:
-    Title: {title}
-    Content: {truncated_content}
+You are an AI intelligence agent sorting global news.
+Title: {title}
+Content: {(content or '')[:3000]}
 
-    Your job:
-    1. Summarize it into exactly 2 punchy bullet points.
-    2. Extract the main country it focuses on and provide its 3-letter ISO country code (e.g., USA, JPN, BRA, GBR). If it is global, use 'GLOBAL'.
-    3. Categorize this article into EXACTLY ONE of the following topics: Sports, Business, Economics, Finance, Technology, Conflict, Culture, or General.
-
-    Respond with a valid JSON object only, without markdown:
-    {{
-        "summary": "- Bullet 1\\n- Bullet 2",
-        "country_code": "ISO_CODE",
-        "topic": "TOPIC_NAME"
-    }}
-    """
-
+Summarize in exactly two factual bullet points; identify the primary country
+with its three-letter ISO code (or GLOBAL); classify into exactly ONE of:
+Sports, Business, Economics, Finance, Technology, Conflict, Culture, General.
+Respond ONLY with valid JSON:
+{{"summary":"- Bullet 1\\n- Bullet 2","country_code":"ISO_CODE","topic":"TOPIC_NAME"}}
+"""
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a strict data-extraction engine. Respond with JSON only, "
-                "with keys summary, country_code, and topic."
-            ),
-        },
+        {"role": "system", "content": "You are a strict news extraction engine. Return only JSON with keys summary, country_code, topic."},
         {"role": "user", "content": prompt},
     ]
+    if not groq_client and not deepinfra_client:
+        raise RuntimeError("Configure GROQ_API_KEY and/or DEEPINFRA_API_KEY")
 
-    for model in GROQ_MODELS:
+    for model in MODEL_ORDER:
+        is_paid = model.startswith("deepinfra/")
+        if (is_paid and not deepinfra_client) or (not is_paid and not groq_client):
+            continue
         remaining = model_cooldowns.get(model, 0) - time.time()
         if remaining > 0:
             print(f"   ⏭️ {model} cooling down ({remaining:.0f}s remaining)")
             continue
-
+        ledger_id = None
         try:
-            print(f"   🤖 Trying Groq model: {model}")
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                timeout=20,
-            )
-            result = json.loads(completion.choices[0].message.content)
-            summary = result.get("summary")
-            country = result.get("country_code")
-            topic = result.get("topic")
-            allowed_topics = {
-                "Sports", "Business", "Economics", "Finance", "Technology",
-                "Conflict", "Culture", "General",
-            }
-            if not all(isinstance(v, str) and v.strip() for v in (summary, country, topic)):
-                raise ValueError("Model returned missing/empty JSON fields")
-            topic = topic.strip().capitalize()
-            if topic not in allowed_topics:
-                raise ValueError(f"Unexpected topic from {model}: {topic}")
+            if is_paid:
+                estimate = estimate_deepinfra_reservation(messages)
+                ledger_id = reserve_deepinfra(conn, article_id, estimate)
+                if ledger_id is None:
+                    # Prevent repeated attempts during the current run.
+                    model_cooldowns[model] = time.time() + 86400
+                    print("   💰 DeepInfra local daily estimated budget reached; retaining queue")
+                    continue
+                print(f"   💳 Trying DeepInfra paid overflow: {DEEPINFRA_MODEL}")
+                response = deepinfra_client.chat.completions.create(
+                    model=DEEPINFRA_MODEL,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    max_tokens=DEEPINFRA_MAX_OUTPUT_TOKENS,
+                )
+                record_deepinfra_usage(conn, ledger_id, response)
+            else:
+                print(f"   🤖 Trying Groq model: {model}")
+                response = groq_client.chat.completions.create(
+                    model=model.removeprefix("groq/"),
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    timeout=20,
+                )
+            summary, country, topic = parse_article_json(response.choices[0].message.content, model)
             print(f"   ✅ LLM succeeded with {model}")
-            return summary, country.strip().upper(), topic, model
-
-        except RateLimitError as exc:
+            return summary, country, topic, model
+        except (RateLimitError, DeepInfraRateLimitError) as exc:
             delay = retry_after_seconds(exc)
             model_cooldowns[model] = time.time() + delay
-            print(f"   ⚠️ {model} rate-limited; cooldown {delay:.0f}s. Switching models...")
-        except (ValueError, json.JSONDecodeError, KeyError, IndexError, AttributeError) as exc:
-            print(f"   ⚠️ Invalid model output from {model}: {exc}. Switching models...")
-        # Authentication, connection, and other API failures propagate to caller
-        # instead of silently writing incorrect labels to SQLite.
-
-    raise AllModelsUnavailable("All Groq models are rate-limited or returned invalid output")
+            print(f"   ⚠️ {model} rate-limited; cooldown {delay:.0f}s; trying fallback")
+        except (BadRequestError, DeepInfraAPIStatusError) as exc:
+            # Groq JSON generation errors and DeepInfra 4xx/5xx. Auth errors
+            # are configuration problems: surface rather than silently retry.
+            status = getattr(exc, "status_code", None)
+            if status in (401, 403):
+                raise
+            if status in (429, 500, 502, 503, 504):
+                model_cooldowns[model] = time.time() + retry_after_seconds(exc)
+                print(f"   ⚠️ {model} API unavailable ({status}); trying fallback")
+                continue
+            if "json_validate_failed" in str(exc):
+                print(f"   ⚠️ {model} could not produce valid JSON; trying fallback")
+                continue
+            raise
+        except (DeepInfraConnectionError, DeepInfraTimeoutError) as exc:
+            model_cooldowns[model] = time.time() + 60
+            print(f"   ⚠️ DeepInfra connection/timeout: {exc}; queued for retry if needed")
+        except (ValueError, KeyError, IndexError, AttributeError) as exc:
+            print(f"   ⚠️ Invalid model output from {model}: {exc}; trying fallback")
+    raise AllModelsUnavailable("All configured models unavailable or produced invalid output")
 
 
 # ==========================================
@@ -410,18 +504,37 @@ def collect_articles(conn):
 
 
 def process_pending_articles(conn):
-    """Process oldest due jobs, retrying later without losing the originating record."""
+    """Work through pending/retry rows within a time budget, pausing for short 429s."""
     processed = 0
-    while True:
+    started = time.monotonic()
+    deadline = started + MAX_PROCESSING_MINUTES * 60
+
+    while processed < MAX_ARTICLES_PER_RUN and time.monotonic() < deadline:
+        # When all models are cooling down, wait until the nearest one is available.
+        # Waiting here (before claiming a row) avoids incrementing attempt_count
+        # simply because a model is temporarily unavailable.
+        delays = [max(0.0, model_cooldowns.get(m, 0) - time.time())
+                  for m in MODEL_ORDER if (deepinfra_client if m.startswith("deepinfra/") else groq_client)]
+        if delays and all(d > 0 for d in delays):
+            wait = min(delays)
+            remaining_budget = deadline - time.monotonic()
+            if wait > MAX_COOLDOWN_WAIT_SECONDS or wait + 1 >= remaining_budget:
+                print(f"   ⏸️ Models unavailable for {wait:.0f}s; leaving queue intact for next run.")
+                break
+            print(f"   ⏳ All models cooling down; waiting {wait:.1f}s before continuing...")
+            time.sleep(wait + 0.2)
+            continue
+
         now = datetime.now().isoformat()
         item = conn.execute("""
             SELECT id, title, raw_content, attempt_count FROM articles
             WHERE processing_status IN ('pending', 'retry')
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-            ORDER BY id ASC LIMIT 1
+            ORDER BY timestamp DESC, id DESC LIMIT 1
         """, (now,)).fetchone()
         if not item:
             break
+
         article_id, title, content, previous_attempts = item
         conn.execute("""
             UPDATE articles SET processing_status = 'processing',
@@ -429,9 +542,9 @@ def process_pending_articles(conn):
             WHERE id = ?
         """, (article_id,))
         conn.commit()
+
         try:
-            # Return the model used as well, to make fallback activity auditable.
-            summary, country, topic, model = query_local_llm(title, content or '')
+            summary, country, topic, model = query_local_llm(title, content or '', conn, article_id)
             conn.execute("""
                 UPDATE articles
                 SET summary = ?, country_code = ?, topic_tag = ?,
@@ -442,20 +555,31 @@ def process_pending_articles(conn):
             conn.commit()
             processed += 1
             print(f"   ✅ Article {article_id} completed with {model}")
+
         except AllModelsUnavailable as exc:
-            # Respect each model's Retry-After; don't hammer every pending row.
-            future = [t for t in model_cooldowns.values() if t > time.time()]
-            delay = max(60, min(future) - time.time()) if future else 300
-            retry_at = (datetime.now() + timedelta(seconds=delay + 5)).isoformat()
+            # Leave this article in SQLite; keep trying in THIS run only if a
+            # rate-limited model will become available shortly.
+            future = [model_cooldowns[m] for m in MODEL_ORDER
+                      if model_cooldowns.get(m, 0) > time.time()]
+            delay = max(5, min(future) - time.time()) if future else 60
+            retry_at = (datetime.now() + timedelta(seconds=delay + 2)).isoformat()
             conn.execute("""
                 UPDATE articles SET processing_status = 'retry',
                     next_attempt_at = ?, last_error = ? WHERE id = ?
             """, (retry_at, str(exc)[:1000], article_id))
             conn.commit()
             print(f"   ⏳ Article {article_id} retained; next attempt after {retry_at}.")
-            break  # Other queued articles stay pending until the next run.
+            if not future or delay > MAX_COOLDOWN_WAIT_SECONDS:
+                break
+            budget = deadline - time.monotonic()
+            if delay + 2 >= budget:
+                break
+            print(f"   ⏳ Waiting {delay:.1f}s for models to recover...")
+            time.sleep(delay + 0.2)
+            # Other eligible articles can proceed while this row's retry date
+            # is in the future; the failed row will be retried when due.
+
         except Exception as exc:
-            # Retry transient network, timeout and unexpected errors, with capped backoff.
             attempts = previous_attempts + 1
             delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
             retry_at = (datetime.now() + timedelta(seconds=delay)).isoformat()
@@ -465,12 +589,12 @@ def process_pending_articles(conn):
             """, (retry_at, str(exc)[:1000], article_id))
             conn.commit()
             print(f"   ⚠️ Article {article_id} queued for retry at {retry_at}: {exc}")
-            # Continue with other due articles rather than losing this one.
 
     stats = dict(conn.execute("""
         SELECT processing_status, COUNT(*) FROM articles GROUP BY processing_status
     """).fetchall())
-    print(f"Processing finished: {processed} completed this run. Queue totals: {stats}")
+    elapsed = (time.monotonic() - started) / 60
+    print(f"Processing finished: {processed} completed in {elapsed:.1f} min. Queue totals: {stats}")
 
 
 def run_ingestion_pipeline():
