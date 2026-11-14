@@ -25,7 +25,7 @@ MAX_ENTRIES_PER_FEED = 50  # Number of RSS items considered per source, NOT proc
 MAX_PROCESSING_MINUTES = 30  # Maximum LLM processing time for one workflow run.
 MAX_ARTICLES_PER_RUN = 600   # Safety ceiling; the time/API budget usually limits throughput.
 MAX_COOLDOWN_WAIT_SECONDS = 120  # Wait for brief 429 cooldowns, not daily exhaustion.
-DEEPINFRA_DAILY_ESTIMATED_BUDGET_USD = 0.50  # Local estimated usage ceiling, not a provider-enforced spend limit.
+DEEPINFRA_DAILY_ESTIMATED_nBUDGET_USD = 0.50  # Local estimated usage ceiling, not a provider-enforced spend limit.
 DEEPINFRA_MAX_OUTPUT_TOKENS = 1024
 
 # ==========================================
