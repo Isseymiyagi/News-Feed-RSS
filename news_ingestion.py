@@ -1,4 +1,4 @@
-import sqlite3
+from news_vault_supabase_db import get_connection
 import urllib.request
 import json
 import re
@@ -20,10 +20,9 @@ import os
 # ==========================================
 # CONFIGURATION & SOURCES
 # ==========================================
-DB_NAME = "news_vault.db"
 MAX_ENTRIES_PER_FEED = 50  # Number of RSS items considered per source, NOT processing capacity.
-MAX_PROCESSING_MINUTES = 30  # Maximum LLM processing time for one workflow run.
-MAX_ARTICLES_PER_RUN = 600   # Safety ceiling; the time/API budget usually limits throughput.
+MAX_PROCESSING_MINUTES = 20  # Maximum LLM processing time for one workflow run.
+MAX_ARTICLES_PER_RUN = 500   # Safety ceiling; the time/API budget usually limits throughput.
 MAX_COOLDOWN_WAIT_SECONDS = 120  # Wait for brief 429 cooldowns, not daily exhaustion.
 DEEPINFRA_DAILY_ESTIMATED_BUDGET_USD = 0.50  # Local estimated usage ceiling, not a provider-enforced spend limit.
 DEEPINFRA_MAX_OUTPUT_TOKENS = 1024
@@ -32,57 +31,44 @@ DEEPINFRA_MAX_OUTPUT_TOKENS = 1024
 # STAGE 5: DATABASE SETUP
 # ==========================================
 def initialize_database():
-    """Create the database and migrate older news_vault.db files without deleting articles."""
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT, source TEXT, raw_content TEXT, summary TEXT,
-            country_code TEXT, timestamp TEXT, link_url TEXT,
-            topic_tag TEXT, image_url TEXT
-        )
-    """)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
-    extra_columns = {
-        "processing_status": "TEXT NOT NULL DEFAULT 'completed'",
-        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-        "next_attempt_at": "TEXT",
-        "last_error": "TEXT",
-        "processed_at": "TEXT",
-        "model_used": "TEXT",
-    }
-    for name, definition in extra_columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {definition}")
+    """Connect to the already-migrated Supabase schema; do not recreate tables."""
+    conn = get_connection()
+    try:
+        # Avoid two overlapping scheduled runs consuming the same queue or budget.
+        # Session advisory lock stays held across commits and LLM API calls.
+        acquired = conn.execute("SELECT pg_try_advisory_lock(68423017)").fetchone()[0]
+        conn.commit()
+        if not acquired:
+            raise RuntimeError("Another news ingestion run is active; skipping this run")
 
-    # Previous script wrote a failure message as if it were a successful summary.
-    conn.execute("""
-        UPDATE articles
-        SET processing_status = 'retry', summary = NULL,
-            country_code = NULL, topic_tag = NULL, next_attempt_at = NULL,
-            last_error = 'Legacy Groq failure placeholder; queued for reprocessing'
-        WHERE summary = 'Failed to generate summary automatically.'
-    """)
-    # Crash recovery: a job interrupted mid-request is eligible for retry.
-    conn.execute("""
-        UPDATE articles SET processing_status = 'retry', next_attempt_at = NULL
-        WHERE processing_status = 'processing'
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_queue ON articles(processing_status, next_attempt_at, id)")
-    # Persistent estimate ledger survives scheduled runs, to avoid unbounded paid overflow.
-    conn.execute("""CREATE TABLE IF NOT EXISTS paid_inference_ledger (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        charged_utc_date TEXT NOT NULL,
-        article_id INTEGER NOT NULL,
-        model TEXT NOT NULL,
-        reserved_usd REAL NOT NULL,
-        actual_usd REAL,
-        created_at TEXT NOT NULL
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_paid_inference_day ON paid_inference_ledger(charged_utc_date)")
-    conn.commit()
-    return conn
+        required = {"articles", "paid_inference_ledger"}
+        existing = {
+            row[0] for row in conn.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name IN ('articles', 'paid_inference_ledger')
+            """).fetchall()
+        }
+        if existing != required:
+            raise RuntimeError(f"Missing Supabase tables: {sorted(required - existing)}")
+
+        # Recover rows interrupted in a previous run. Only run after acquiring lock.
+        conn.execute("""
+            UPDATE articles SET processing_status = 'retry', next_attempt_at = NULL
+            WHERE processing_status = 'processing'
+        """)
+        conn.execute("""
+            UPDATE articles
+            SET processing_status = 'retry', summary = NULL,
+                country_code = NULL, topic_tag = NULL, next_attempt_at = NULL,
+                last_error = 'Legacy Groq failure placeholder; queued for reprocessing'
+            WHERE summary = 'Failed to generate summary automatically.'
+        """)
+        conn.commit()
+        return conn
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
 
 
 # ==========================================
@@ -159,7 +145,7 @@ def deepinfra_budget_available(conn, estimate):
     today = datetime.now(timezone.utc).date().isoformat()
     spent = conn.execute("""
         SELECT COALESCE(SUM(COALESCE(actual_usd, reserved_usd)), 0)
-        FROM paid_inference_ledger WHERE charged_utc_date = ?
+        FROM paid_inference_ledger WHERE charged_utc_date = %s
     """, (today,)).fetchone()[0]
     return spent + estimate <= DEEPINFRA_DAILY_ESTIMATED_BUDGET_USD
 
@@ -170,10 +156,12 @@ def reserve_deepinfra(conn, article_id, estimate):
     cursor = conn.execute("""
         INSERT INTO paid_inference_ledger
             (charged_utc_date, article_id, model, reserved_usd, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
     """, (now.date().isoformat(), article_id, DEEPINFRA_MODEL, estimate, now.isoformat()))
+    ledger_id = cursor.fetchone()[0]
     conn.commit()
-    return cursor.lastrowid
+    return ledger_id
 
 def record_deepinfra_usage(conn, ledger_id, completion):
     usage = getattr(completion, "usage", None)
@@ -188,7 +176,7 @@ def record_deepinfra_usage(conn, ledger_id, completion):
             return
         cost = (inp * DEEPINFRA_INPUT_PRICE_PER_MILLION +
                 out * DEEPINFRA_OUTPUT_PRICE_PER_MILLION) / 1_000_000
-    conn.execute("UPDATE paid_inference_ledger SET actual_usd = ? WHERE id = ?",
+    conn.execute("UPDATE paid_inference_ledger SET actual_usd = %s WHERE id = %s",
                  (float(cost), ledger_id))
     conn.commit()
     print(f"   💵 DeepInfra estimated request cost: ${float(cost):.6f}")
@@ -385,7 +373,7 @@ def extract_image_url(entry):
 
 
 def collect_articles(conn):
-    """Collect RSS entries to SQLite first, independently of Groq availability."""
+    """Collect RSS entries to Supabase first, independently of Groq availability."""
     cursor = conn.cursor()
     print(f"[{datetime.now()}] RSS collection started.")
     UPDATED_SOURCES = [
@@ -471,7 +459,7 @@ def collect_articles(conn):
                 raw_content = clean_html(entry.get('description') or entry.get('summary') or '')
                 cursor.execute("""
                     SELECT id FROM articles
-                    WHERE (link_url = ? AND ? <> '') OR (title = ? AND source = ?)
+                    WHERE (link_url = %s AND %s <> '') OR (title = %s AND source = %s)
                     LIMIT 1
                 """, (link_url, link_url, title, source['name']))
                 if cursor.fetchone():
@@ -493,12 +481,14 @@ def collect_articles(conn):
                 cursor.execute("""
                     INSERT INTO articles
                         (title, source, raw_content, timestamp, link_url, image_url, processing_status)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending')
                 """, (title, source['name'], raw_content, datetime.now().isoformat(), link_url, image_url))
                 conn.commit()  # Save EACH item immediately; a later failure cannot erase it.
                 collected += 1
+            conn.commit()  # Close the transaction even if all items were duplicates.
         except Exception as exc:
             print(f"❌ RSS error from {source['name']}: {exc}")
+            conn.rollback()
             traceback.print_exc()
     print(f"RSS collection finished: {collected} new queued articles.")
 
@@ -529,17 +519,18 @@ def process_pending_articles(conn):
         item = conn.execute("""
             SELECT id, title, raw_content, attempt_count FROM articles
             WHERE processing_status IN ('pending', 'retry')
-              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+              AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
             ORDER BY timestamp DESC, id DESC LIMIT 1
         """, (now,)).fetchone()
         if not item:
+            conn.commit()
             break
 
         article_id, title, content, previous_attempts = item
         conn.execute("""
             UPDATE articles SET processing_status = 'processing',
                 attempt_count = attempt_count + 1, last_error = NULL
-            WHERE id = ?
+            WHERE id = %s
         """, (article_id,))
         conn.commit()
 
@@ -547,17 +538,18 @@ def process_pending_articles(conn):
             summary, country, topic, model = query_local_llm(title, content or '', conn, article_id)
             conn.execute("""
                 UPDATE articles
-                SET summary = ?, country_code = ?, topic_tag = ?,
-                    processing_status = 'completed', processed_at = ?,
-                    model_used = ?, next_attempt_at = NULL, last_error = NULL
-                WHERE id = ?
+                SET summary = %s, country_code = %s, topic_tag = %s,
+                    processing_status = 'completed', processed_at = %s,
+                    model_used = %s, next_attempt_at = NULL, last_error = NULL
+                WHERE id = %s
             """, (summary, country, topic, datetime.now().isoformat(), model, article_id))
             conn.commit()
             processed += 1
             print(f"   ✅ Article {article_id} completed with {model}")
 
         except AllModelsUnavailable as exc:
-            # Leave this article in SQLite; keep trying in THIS run only if a
+            conn.rollback()
+            # Leave this article in Supabase; keep trying in THIS run only if a
             # rate-limited model will become available shortly.
             future = [model_cooldowns[m] for m in MODEL_ORDER
                       if model_cooldowns.get(m, 0) > time.time()]
@@ -565,7 +557,7 @@ def process_pending_articles(conn):
             retry_at = (datetime.now() + timedelta(seconds=delay + 2)).isoformat()
             conn.execute("""
                 UPDATE articles SET processing_status = 'retry',
-                    next_attempt_at = ?, last_error = ? WHERE id = ?
+                    next_attempt_at = %s, last_error = %s WHERE id = %s
             """, (retry_at, str(exc)[:1000], article_id))
             conn.commit()
             print(f"   ⏳ Article {article_id} retained; next attempt after {retry_at}.")
@@ -580,12 +572,14 @@ def process_pending_articles(conn):
             # is in the future; the failed row will be retried when due.
 
         except Exception as exc:
+            # A failed PostgreSQL statement aborts its transaction until rollback.
+            conn.rollback()
             attempts = previous_attempts + 1
             delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
             retry_at = (datetime.now() + timedelta(seconds=delay)).isoformat()
             conn.execute("""
                 UPDATE articles SET processing_status = 'retry',
-                    next_attempt_at = ?, last_error = ? WHERE id = ?
+                    next_attempt_at = %s, last_error = %s WHERE id = %s
             """, (retry_at, str(exc)[:1000], article_id))
             conn.commit()
             print(f"   ⚠️ Article {article_id} queued for retry at {retry_at}: {exc}")
@@ -593,6 +587,7 @@ def process_pending_articles(conn):
     stats = dict(conn.execute("""
         SELECT processing_status, COUNT(*) FROM articles GROUP BY processing_status
     """).fetchall())
+    conn.commit()
     elapsed = (time.monotonic() - started) / 60
     print(f"Processing finished: {processed} completed in {elapsed:.1f} min. Queue totals: {stats}")
 
@@ -604,9 +599,30 @@ def run_ingestion_pipeline():
         collect_articles(conn)
         process_pending_articles(conn)
     finally:
-        conn.close()
+        conn.close()  # Releases the session advisory lock.
     print(f"[{datetime.now()}] Ingestion cycle finished.")
 
 
+def check_database():
+    """Read-only connectivity and schema check; does not fetch or process articles."""
+    with get_connection() as conn:
+        for table in ("articles", "paid_inference_ledger"):
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            print(f"{table}: {count:,} rows")
+        statuses = conn.execute("""
+            SELECT processing_status, COUNT(*) FROM articles
+            GROUP BY processing_status ORDER BY processing_status
+        """).fetchall()
+        print("Processing statuses:", dict(statuses))
+    print("Supabase ingestion preflight passed; no changes made.")
+
+
 if __name__ == "__main__":
-    run_ingestion_pipeline()
+    import argparse
+    parser = argparse.ArgumentParser(description="Global news ingestion using Supabase PostgreSQL")
+    parser.add_argument("--check-db", action="store_true", help="Check Supabase schema and counts without ingesting")
+    args = parser.parse_args()
+    if args.check_db:
+        check_database()
+    else:
+        run_ingestion_pipeline()

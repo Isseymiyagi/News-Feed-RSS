@@ -1,7 +1,7 @@
-import sqlite3
+from datetime import datetime, timedelta
+from news_vault_supabase_db import get_connection
 import streamlit as st
 
-DB_PATH = "news_vault.db"
 PAGE_SIZE = 25
 
 st.set_page_config(layout="wide", page_title="Global Intel Stream")
@@ -26,27 +26,25 @@ def clear_filters():
 # Use the incoming map link as the initial country selection.
 url_country = st.query_params.get("country", "").upper()
 
-with sqlite3.connect(DB_PATH) as conn:
-    available_countries = [
-        row[0] for row in conn.execute(
-            """
+with get_connection() as conn:
+    with conn.cursor() as cur:
+        cur.execute("""
             SELECT DISTINCT UPPER(TRIM(country_code))
             FROM articles
             WHERE country_code IS NOT NULL AND TRIM(country_code) <> ''
             ORDER BY 1
-            """
-        ).fetchall()
-    ]
-    available_sources = [
-        row[0] for row in conn.execute(
-            """
+        """)
+        available_countries = [row[0] for row in cur.fetchall()]
+
+        cur.execute("""
             SELECT DISTINCT TRIM(source)
             FROM articles
             WHERE source IS NOT NULL AND TRIM(source) <> ''
-            ORDER BY 1 COLLATE NOCASE
-            """
-        ).fetchall()
-    ]
+            ORDER BY 1
+        """)
+        available_sources = sorted(
+            (row[0] for row in cur.fetchall()), key=str.casefold
+        )
 
 country_options = ["All Countries"] + available_countries
 source_options = ["All Sources"] + available_sources
@@ -118,63 +116,69 @@ country_aliases = {"USA": "US", "GBR": "GB", "FRA": "FR", "ETH": "ET"}
 if selected_country != "All Countries":
     other_code = country_aliases.get(selected_country)
     if other_code:
-        conditions.append("country_code IN (?, ?)")
+        conditions.append("UPPER(TRIM(country_code)) IN (%s, %s)")
         params.extend([selected_country, other_code])
     else:
-        conditions.append("country_code = ?")
+        conditions.append("UPPER(TRIM(country_code)) = %s")
         params.append(selected_country)
 
 if selected_topic != "All Topics":
-    conditions.append("topic_tag = ?")
+    conditions.append("topic_tag = %s")
     params.append(selected_topic)
 
 if selected_source != "All Sources":
-    conditions.append("TRIM(source) = ?")
+    conditions.append("TRIM(source) = %s")
     params.append(selected_source)
 
 if search_query.strip():
-    conditions.append("(title LIKE ? OR summary LIKE ?)")
+    conditions.append("(title ILIKE %s OR summary ILIKE %s)")
     term = f"%{search_query.strip()}%"
     params.extend([term, term])
 
-period_to_modifier = {
-    "Past 24 Hours": "-1 day",
-    "Past 7 Days": "-7 days",
-    "Past 30 Days": "-30 days",
-    "Past 90 Days": "-90 days",
+period_to_days = {
+    "Past 24 Hours": 1,
+    "Past 7 Days": 7,
+    "Past 30 Days": 30,
+    "Past 90 Days": 90,
 }
-if selected_period in period_to_modifier:
-    conditions.append("timestamp >= datetime('now', ?)")
-    params.append(period_to_modifier[selected_period])
+if selected_period in period_to_days:
+    # The migrated SQLite timestamps are ISO text without timezone information.
+    # Compare against an ISO cutoff in the same text format, preserving that schema.
+    cutoff = (datetime.now() - timedelta(days=period_to_days[selected_period])).isoformat()
+    conditions.append('"timestamp" >= %s')
+    params.append(cutoff)
 
 where_clause = " AND ".join(conditions)
 
-with sqlite3.connect(DB_PATH) as conn:
-    total_articles = conn.execute(
-    f"""
-    SELECT COUNT(*)
-    FROM articles
-    WHERE processing_status = 'completed'
-      AND ({where_clause})
-    """,
-    params
-).fetchone()[0]
-    total_pages = max(1, (total_articles + PAGE_SIZE - 1) // PAGE_SIZE)
-    st.session_state.feed_page = min(st.session_state.feed_page, total_pages - 1)
-    page = st.session_state.feed_page
+with get_connection() as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM articles
+            WHERE processing_status = 'completed'
+              AND ({where_clause})
+            """,
+            params,
+        )
+        total_articles = cur.fetchone()[0]
+        total_pages = max(1, (total_articles + PAGE_SIZE - 1) // PAGE_SIZE)
+        st.session_state.feed_page = min(st.session_state.feed_page, total_pages - 1)
+        page = st.session_state.feed_page
 
-articles = conn.execute(
-    f"""
-    SELECT title, source, summary, timestamp, country_code,
-           link_url, topic_tag, image_url
-    FROM articles
-    WHERE processing_status = 'completed'
-      AND ({where_clause})
-    ORDER BY timestamp DESC, id DESC
-    LIMIT ? OFFSET ?
-    """,
-    [*params, PAGE_SIZE, page * PAGE_SIZE],
-).fetchall()
+        cur.execute(
+            f"""
+            SELECT title, source, summary, "timestamp", country_code,
+                   link_url, topic_tag, image_url
+            FROM articles
+            WHERE processing_status = 'completed'
+              AND ({where_clause})
+            ORDER BY "timestamp" DESC, id DESC
+            LIMIT %s OFFSET %s
+            """,
+            [*params, PAGE_SIZE, page * PAGE_SIZE],
+        )
+        articles = cur.fetchall()
 
 if not articles:
     st.info("No matching briefings found for these filters.")

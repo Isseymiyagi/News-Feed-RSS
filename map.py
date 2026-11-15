@@ -1,5 +1,6 @@
 import streamlit as st
-import sqlite3
+from datetime import datetime, timedelta
+from news_vault_supabase_db import get_connection
 import folium
 from streamlit_folium import st_folium
 import json
@@ -13,25 +14,29 @@ st.title("🌍 World Update (Past 24 Hours)")
 st.caption("Map updates dynamically. Shaded colors show briefing volume captured over the last 24 hours. Click any shaded nation to open its feed link.")
 
 def get_rolling_24h_counts():
-    """Queries database to extract metrics captured strictly in the last 24 hours."""
-    conn = sqlite3.connect("news_vault.db")
-    cursor = conn.cursor()
-    # SQL query filtering records against a rolling 24-hour time differential limit
-    cursor.execute("""
-        SELECT country_code, COUNT(*) 
-        FROM articles 
-        WHERE timestamp >= datetime('now', '-1 day')
-        GROUP BY country_code
-    """)
-    raw_data = cursor.fetchall()
-    conn.close()
-    
-    # 2-letter to 3-letter fallback normalizer dictionary layer
+    """Count articles from the past 24 hours in Supabase PostgreSQL.
+
+    The migrated articles.timestamp column is TEXT containing local naive ISO
+    datetime strings, matching the ingestion script's datetime.now().isoformat().
+    Do not cast it to timestamptz without first normalizing stored timezones.
+    """
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT country_code, COUNT(*)
+                FROM articles
+                WHERE timestamp >= %s
+                GROUP BY country_code
+            """, (cutoff,))
+            raw_data = cursor.fetchall()
+
+    # Preserve the original ISO-2 fallback normalization.
     ISO_2_TO_3 = {'US': 'USA', 'GB': 'GBR', 'UK': 'GBR', 'FR': 'FRA', 'JP': 'JPN', 'BR': 'BRA', 'ET': 'ETH'}
-    
     normalized_counts = {}
     for code, count in raw_data:
-        if not code: continue
+        if not code:
+            continue
         code_upper = code.upper().strip()
         iso_3 = ISO_2_TO_3.get(code_upper, code_upper)
         normalized_counts[iso_3] = normalized_counts.get(iso_3, 0) + count

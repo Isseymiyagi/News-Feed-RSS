@@ -7,3 +7,4 @@ groq
 openai
 pandas
 requests
+psycopg[binary]
