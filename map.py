@@ -384,18 +384,26 @@ def render_news_globe(geojson, counts, topic_label):
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
 html,body{margin:0;background:#07101e;color:#edf3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden}
-#globe{width:100%;height:660px;position:relative}
+#globe-shell{position:relative;width:100%;height:660px;isolation:isolate}
+#globe{width:100%;height:660px;position:absolute;inset:0;z-index:0}
+#overlay{position:absolute;inset:0;z-index:20;pointer-events:none}
+#overlay #country-panel,#overlay #label-control{pointer-events:auto}
+#globe canvas{display:block}
 #hud{position:absolute;top:15px;left:16px;z-index:2;padding:12px 15px;border:1px solid #31465f;background:#0a1625db;border-radius:12px;pointer-events:none;max-width:320px}
 #hud strong{display:block;font-size:14px}#hud small{color:#b2c3d5;font-size:12px}
 #legend{position:absolute;bottom:16px;left:16px;z-index:2;padding:9px 12px;border-radius:10px;background:#0a1625dd;border:1px solid #31465f;font-size:12px;color:#b2c3d5}
 #legend .ramp{height:8px;width:175px;border-radius:6px;margin:7px 0 4px;background:linear-gradient(90deg,#314b65,#47a4bd,#f4b860,#e45d54)}
+#country-panel{position:absolute;right:16px;top:16px;z-index:7;width:min(285px,calc(100% - 32px));padding:15px;background:#0b1929f5;border:1px solid #54728a;border-radius:12px;box-shadow:0 8px 28px #0009;display:none}
+#country-panel h3{margin:0 24px 8px 0;font-size:17px}#country-panel p{margin:0 0 12px;color:#b2c3d5;font-size:13px}#country-panel a{display:inline-block;background:#276b93;color:#fff;text-decoration:none;border-radius:8px;padding:9px 12px;font-size:13px;font-weight:650}#close-panel{position:absolute;right:9px;top:7px;border:0;background:transparent;color:white;cursor:pointer;font-size:21px}#label-control{position:absolute;bottom:17px;right:16px;z-index:5;padding:9px 12px;background:#0a1625e8;border:1px solid #31465f;border-radius:9px;font-size:12px;cursor:pointer}
 #tip{position:absolute;z-index:4;display:none;padding:10px 12px;border-radius:9px;background:#071522ed;border:1px solid #50708c;pointer-events:none;font-size:12px;max-width:230px}
 #status{position:absolute;top:50%;width:100%;text-align:center;color:#c6d8e7;pointer-events:none}
 .country-label{font-size:11px;font-weight:600;color:#edf5ff;text-shadow:0 1px 3px #000,0 0 5px #000;white-space:nowrap;pointer-events:none;opacity:.95}
 </style></head><body>
-<div id="globe"><div id="hud"><strong>Global News Intelligence</strong><small id="subtitle"></small></div>
+<div id="globe-shell"><div id="globe"></div><div id="overlay"><div id="hud"><strong>Global News Intelligence</strong><small id="subtitle"></small></div>
 <div id="legend">Articles per country · past 24 hours<div class="ramp"></div><span>Low</span><span style="float:right">High</span></div>
-<div id="tip"></div><div id="status">Loading interactive globe…</div></div>
+<div id="country-panel" role="region" aria-label="Selected country"><button id="close-panel" aria-label="Close country details">×</button><h3 id="panel-name"></h3><p id="panel-count"></p><a id="panel-link" target="_blank" rel="noopener noreferrer">Open News Feed ↗</a></div>
+<label id="label-control"><input type="checkbox" id="show-labels" checked> Show country labels</label>
+<div id="tip"></div><div id="status">Loading interactive globe…</div></div></div>
 <script src="https://unpkg.com/globe.gl@2.45.0/dist/globe.gl.min.js"></script>
 <script>
 const geo = __GEO__;
@@ -425,12 +433,29 @@ function countryUrl(f){
  if(!/^[A-Z]{3}$/.test(iso)) return null;
  return '/news_feed?country='+encodeURIComponent(iso);
 }
-function goCountry(f){
- const url=countryUrl(f);if(!url)return;
- // A top-level navigation preserves the existing Streamlit page URL convention.
- const a=document.createElement('a');a.href=url;a.target='_top';a.rel='noopener';
- document.body.appendChild(a);a.click();a.remove();
+const panel=document.getElementById('country-panel');
+const panelLink=document.getElementById('panel-link');
+function feedUrl(relative){
+ // Streamlit component iframes can have a different origin; use the parent app URL
+ // when same-origin access is permitted, otherwise the document referrer.
+ let appBase='';
+ try{appBase=window.parent.location.href;}catch(e){}
+ if(!appBase) appBase=document.referrer;
+ if(!appBase) appBase=window.location.href;
+ try{return new URL(relative,new URL(appBase).origin).href;}
+ catch(e){return relative;}
 }
+function selectCountry(f){
+ const relative=countryUrl(f);if(!relative)return;
+ const name=String(f.properties.name||f.properties.iso3||'Country');
+ const count=Number(f.properties.news_count)||0;
+ document.getElementById('panel-name').textContent=name;
+ document.getElementById('panel-count').textContent=count+' matching articles in the past 24 hours';
+ panelLink.href=feedUrl(relative);
+ panel.style.display='block';
+ tip.style.display='none';
+}
+document.getElementById('close-panel').addEventListener('click',()=>{panel.style.display='none';});
 if(typeof Globe==='undefined'){
  status.textContent='The 3D globe library could not load. Check internet access or select Classic Map.';
 }else{
@@ -446,8 +471,8 @@ if(typeof Globe==='undefined'){
    .polygonStrokeColor(()=> 'rgba(169,197,223,.48)')
    .polygonAltitude(f=>f.properties.news_count>0?.014:.003)
    .onPolygonHover((f,prev)=>{el.style.cursor=f?'pointer':'grab';})
-   .polygonLabel(f=>`<div style="padding:7px 10px;background:#0b1929;color:white;border-radius:8px;border:1px solid #54728a"><b>${String(f.properties.name||'').replace(/[&<>"']/g,'')}</b><div>${Number(f.properties.news_count)||0} matching articles</div><small>Click to open News Feed</small></div>`)
-   .onPolygonClick(goCountry);
+   .polygonLabel(f=>`<div style="padding:7px 10px;background:#0b1929;color:white;border-radius:8px;border:1px solid #54728a"><b>${String(f.properties.name||'').replace(/[&<>"']/g,'')}</b><div>${Number(f.properties.news_count)||0} matching articles</div><small>Click for country details</small></div>`)
+   .onPolygonClick(selectCountry);
  globe.pointOfView({lat:23,lng:0,altitude:2.25},0);
  globe.controls().autoRotate=true;
  globe.controls().autoRotateSpeed=.24;
@@ -457,18 +482,35 @@ if(typeof Globe==='undefined'){
  el.addEventListener('wheel',stopRotate,{once:true});
  function resize(){globe.width(el.clientWidth).height(660)}
  window.addEventListener('resize',resize);resize();
- // Keep country labels at zoomed-in scales, avoiding world-view clutter.
+ // Use native Globe.gl labels: HTML overlays can be hidden by the WebGL canvas.
+ // Native labels are projected on the globe and occluded on the far side.
  function updateLabels(){
    const altitude=globe.pointOfView().altitude;
-   const visible=labels.filter(p=>altitude<1.5 && (p.tier==='label-large'||altitude<.9 && p.tier==='label-medium'||altitude<.48));
-   globe.htmlElementsData(visible)
-     .htmlLat(p=>p.lat).htmlLng(p=>p.lng).htmlAltitude(.025)
-     .htmlElement(p=>{const e=document.createElement('div');e.className='country-label';e.textContent=p.name;return e;});
+   const enabled=document.getElementById('show-labels').checked;
+   const visible=enabled ? labels.filter(p =>
+     p.tier==='label-large' ||
+     (altitude<1.65 && p.tier==='label-medium') ||
+     (altitude<0.85 && p.tier==='label-small')
+   ) : [];
+   globe.labelsData(visible);
  }
- let previous=Infinity;
+
+globe
+  .labelLat(p => Number(p.lat))
+  .labelLng(p => Number(p.lng))
+  .labelText(p => p.name)
+  .labelSize(p => p.tier === 'label-large' ? 0.90 : p.tier === 'label-medium' ? 0.65 : 0.45)
+  .labelColor(() => 'rgba(255,255,255,1)')
+  .labelDotRadius(0)
+  .labelAltitude(0.035)
+  .labelResolution(3);
+
+ document.getElementById('show-labels').addEventListener('change',updateLabels);
+ updateLabels();
+ let previous=-1;
  globe.controls().addEventListener('change',()=>{
    const alt=globe.pointOfView().altitude;
-   const bucket=alt<.48?3:alt<.9?2:alt<1.5?1:0;
+   const bucket=alt<0.85?3:alt<1.65?2:1;
    if(bucket!==previous){previous=bucket;updateLabels();}
  });
  status.remove();
@@ -483,7 +525,7 @@ if(typeof Globe==='undefined'){
 
 if view_mode == "3D Globe":
     render_news_globe(world_geojson, country_metrics, selected_topic_label)
-    st.caption("3D globe uses externally hosted JavaScript and Earth textures. Click a country to open its feed. Select Classic Map if the globe cannot load.")
+    st.caption("3D globe uses externally hosted JavaScript and Earth textures. Click a country for a persistent information panel and news-feed link. Select Classic Map if the globe cannot load.")
     st.stop()
 
 

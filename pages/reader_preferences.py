@@ -1,6 +1,7 @@
 import streamlit as st
 from news_vault_supabase_db import get_connection
 from reader_store import get_preferences, save_preferences
+from country_config import NAME_TO_ISO
 
 st.set_page_config(layout='wide', page_title='Reader Preferences')
 st.title('⚙️ Reader Preferences')
@@ -9,14 +10,12 @@ try:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT DISTINCT primary_topic FROM (SELECT intelligence_metadata->>'primary_topic' AS primary_topic FROM public.articles) x WHERE primary_topic IS NOT NULL AND primary_topic <> '' ORDER BY 1")
         topics = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT DISTINCT UPPER(TRIM(country_code)) FROM public.articles WHERE country_code IS NOT NULL AND TRIM(country_code) <> '' ORDER BY 1")
-        countries = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT DISTINCT TRIM(source) FROM public.articles WHERE source IS NOT NULL AND TRIM(source) <> '' ORDER BY 1")
         publishers = [r[0] for r in cur.fetchall()]
     saved = get_preferences()
     # Preserve saved values even if a publisher or topic is temporarily absent.
     topics = sorted(set(topics) | set(saved['topics']))
-    countries = sorted(set(countries) | set(saved['countries']))
+    countries = sorted(set(NAME_TO_ISO.values()) | set(saved['countries']))
     publishers = sorted(set(publishers) | set(saved['publishers']), key=str.casefold)
     with st.form('reader_preferences'):
         chosen_topics = st.multiselect('Preferred AI topics', topics, default=saved['topics'])
