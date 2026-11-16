@@ -529,7 +529,16 @@ def collect_articles(conn):
         {
             "name": "War Fronts",
             "url":"https://fronts.co/rss.xml"
-        }
+        },
+        {
+            "name": "Human Rights Watch",
+            "url": "https://www.hrw.org/rss.xml"
+        },
+        {
+            "name": "The Global Initiative Against Transnational Organized Crime",
+            "url": "https://www.globalinitiative.net/feed/"
+        },
+
 
     ]
     
@@ -571,6 +580,8 @@ def collect_articles(conn):
                         "The Economist (World This Week)": "https://images.unsplash.com/photo-1785314981488-8345bc70dc92?q=80&w=1373&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D",
                         "Semafor": "https://images.unsplash.com/photo-1595194512722-9a5003713e41?q=80&w=1470&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D",
                         "Deutsche Welle": "https://images.unsplash.com/photo-1618259278412-2819cbdea4dc?q=80&w=1421&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D",
+                        "Human Rights Watch": "https://images.unsplash.com/photo-1673296630925-a16a5592cc14?q=80&w=1032&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D",
+                        "The Global Initiative Against Transnational Organized Crime": "https://images.unsplash.com/photo-1590274853856-f22d5ee3d228?q=80&w=1470&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D"
                     }
                     image_url = image_ids.get(source['name'], image_ids['BBC News (Global Edition)'])
 
