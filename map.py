@@ -11,38 +11,81 @@ from jinja2 import Template
 st.set_page_config(layout="wide", page_title="Global Intelligence Map")
 
 st.title("🌍 World Update (Past 24 Hours)")
-st.caption("Map updates dynamically. Shaded colors show briefing volume captured over the last 24 hours. Click any shaded nation to open its feed link.")
+st.caption("Country shading shows news volume over the past 24 hours. Filter by AI-classified topic, then click a country to open its news feed.")
 
-def get_rolling_24h_counts():
-    """Count articles from the past 24 hours in Supabase PostgreSQL.
+# The AI intelligence taxonomy from Stage 5A. Both primary and secondary
+# classifications are included, so an article is counted only once per country.
+TOPIC_OPTIONS = {
+    "All Topics": None,
+    "Arts & Culture": "ARTS_CULTURE",
+    "Business": "BUSINESS",
+    "Comedy": "COMEDY",
+    "Crime": "CRIME",
+    "Economics": "ECONOMICS",
+    "Education": "EDUCATION",
+    "Entertainment": "ENTERTAINMENT",
+    "Environment": "ENVIRONMENT",
+    "Finance": "FINANCE",
+    "Media": "MEDIA",
+    "Politics": "POLITICS",
+    "Religion": "RELIGION",
+    "Science": "SCIENCE",
+    "Sports": "SPORTS",
+    "Technology": "TECHNOLOGY",
+    "War & Conflict": "WAR_CONFLICT",
+    "Women": "WOMEN",
+}
+selected_topic_label = st.selectbox(
+    "Filter map by topic", options=list(TOPIC_OPTIONS), index=0,
+    key="world_map_topic_filter",
+)
+selected_topic = TOPIC_OPTIONS[selected_topic_label]
 
-    The migrated articles.timestamp column is TEXT containing local naive ISO
-    datetime strings, matching the ingestion script's datetime.now().isoformat().
-    Do not cast it to timestamptz without first normalizing stored timezones.
+
+def get_rolling_24h_counts(topic=None):
+    """Count articles by country for the rolling 24h window.
+
+    The legacy timestamp is ISO-format TEXT generated from naive local time;
+    preserve the original comparison until the stored timestamps are migrated.
     """
     cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+    sql = """
+        SELECT country_code, COUNT(*)
+        FROM articles
+        WHERE "timestamp" >= %s
+    """
+    params = [cutoff]
+    if topic is not None:
+        # No publisher RSS tags or keyword guesses: only Stage 5A AI metadata.
+        # JSONB containment matches a secondary topic in an array.
+        sql += """
+            AND (
+                intelligence_metadata->>'primary_topic' = %s
+                OR COALESCE(intelligence_metadata->'secondary_topics', '[]'::jsonb)
+                   @> %s::jsonb
+            )
+        """
+        params.extend([topic, json.dumps([topic])])
+    sql += " GROUP BY country_code"
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT country_code, COUNT(*)
-                FROM articles
-                WHERE timestamp >= %s
-                GROUP BY country_code
-            """, (cutoff,))
+            cursor.execute(sql, tuple(params))
             raw_data = cursor.fetchall()
 
-    # Preserve the original ISO-2 fallback normalization.
     ISO_2_TO_3 = {'US': 'USA', 'GB': 'GBR', 'UK': 'GBR', 'FR': 'FRA', 'JP': 'JPN', 'BR': 'BRA', 'ET': 'ETH'}
     normalized_counts = {}
     for code, count in raw_data:
         if not code:
             continue
-        code_upper = code.upper().strip()
+        code_upper = str(code).upper().strip()
         iso_3 = ISO_2_TO_3.get(code_upper, code_upper)
         normalized_counts[iso_3] = normalized_counts.get(iso_3, 0) + count
     return normalized_counts
 
-country_metrics = get_rolling_24h_counts()
+
+country_metrics = get_rolling_24h_counts(selected_topic)
+if selected_topic is not None:
+    st.caption(f"Showing {selected_topic_label.lower()} articles classified by AI (primary or secondary topic). Countries with no matching articles are unshaded.")
 
 @st.cache_data
 def load_geojson():
@@ -294,6 +337,156 @@ COUNTRY_LABEL_CSS = """
 
 
 
+# Stage 5G: Globe view uses the same AI-filtered counts and GeoJSON as Classic Map.
+# The classic Folium implementation below remains unchanged as a fallback.
+import streamlit.components.v1 as components
+from html import escape
+
+view_mode = st.radio(
+    "Map style", ["3D Globe", "Classic Map"], horizontal=True,
+    key="world_map_view_mode",
+)
+
+
+def render_news_globe(geojson, counts, topic_label):
+    # Keep country IDs and counts together in the same feature payload.
+    # Avoid mutating the cached GeoJSON object shared across Streamlit reruns.
+    features = []
+    for source_feature in geojson.get("features", []):
+        feature = dict(source_feature)
+        props = dict(source_feature.get("properties") or {})
+        iso = str(source_feature.get("id") or props.get("ISO_A3") or "").upper()
+        props["news_count"] = int(counts.get(iso, 0))
+        props["iso3"] = iso
+        feature["properties"] = props
+        features.append(feature)
+
+    label_points = []
+    for feature in features:
+        props = feature["properties"]
+        name = props.get("name", "")
+        iso = props["iso3"]
+        anchor = COUNTRY_ANCHORS.get(iso)
+        if not anchor:
+            continue
+        tier = LABEL_TIERS.get(name, "label-small")
+        label_points.append({
+            "name": name, "iso3": iso, "lat": anchor["lat"],
+            "lng": anchor["lon"], "tier": tier,
+            "count": props["news_count"],
+        })
+
+    payload = json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False).replace("<", "\\u003c")
+    labels = json.dumps(label_points, ensure_ascii=False).replace("<", "\\u003c")
+    topic = json.dumps(topic_label).replace("<", "\\u003c")
+    # HTML runs in a Streamlit iframe. External globe.gl CDN is required.
+    html_doc = r"""<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+html,body{margin:0;background:#07101e;color:#edf3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden}
+#globe{width:100%;height:660px;position:relative}
+#hud{position:absolute;top:15px;left:16px;z-index:2;padding:12px 15px;border:1px solid #31465f;background:#0a1625db;border-radius:12px;pointer-events:none;max-width:320px}
+#hud strong{display:block;font-size:14px}#hud small{color:#b2c3d5;font-size:12px}
+#legend{position:absolute;bottom:16px;left:16px;z-index:2;padding:9px 12px;border-radius:10px;background:#0a1625dd;border:1px solid #31465f;font-size:12px;color:#b2c3d5}
+#legend .ramp{height:8px;width:175px;border-radius:6px;margin:7px 0 4px;background:linear-gradient(90deg,#314b65,#47a4bd,#f4b860,#e45d54)}
+#tip{position:absolute;z-index:4;display:none;padding:10px 12px;border-radius:9px;background:#071522ed;border:1px solid #50708c;pointer-events:none;font-size:12px;max-width:230px}
+#status{position:absolute;top:50%;width:100%;text-align:center;color:#c6d8e7;pointer-events:none}
+.country-label{font-size:11px;font-weight:600;color:#edf5ff;text-shadow:0 1px 3px #000,0 0 5px #000;white-space:nowrap;pointer-events:none;opacity:.95}
+</style></head><body>
+<div id="globe"><div id="hud"><strong>Global News Intelligence</strong><small id="subtitle"></small></div>
+<div id="legend">Articles per country · past 24 hours<div class="ramp"></div><span>Low</span><span style="float:right">High</span></div>
+<div id="tip"></div><div id="status">Loading interactive globe…</div></div>
+<script src="https://unpkg.com/globe.gl@2.45.0/dist/globe.gl.min.js"></script>
+<script>
+const geo = __GEO__;
+const labels = __LABELS__;
+const topic = __TOPIC__;
+const el = document.getElementById('globe');
+const tip = document.getElementById('tip');
+const status = document.getElementById('status');
+document.getElementById('subtitle').textContent = topic + ' · past 24 hours · drag to rotate';
+const maxCount = Math.max(1, ...geo.features.map(f=>Number(f.properties.news_count)||0));
+function shade(n){
+ if(!n) return 'rgba(64,83,106,.36)';
+ const v = Math.log1p(n)/Math.log1p(maxCount);
+ if(v<.34) return 'rgba(57,150,184,.86)';
+ if(v<.68) return 'rgba(244,181,91,.91)';
+ return 'rgba(232,91,81,.94)';
+}
+function showTip(ev, text){
+ if(!ev){tip.style.display='none';return;}
+ tip.textContent=text;tip.style.display='block';
+ const box=el.getBoundingClientRect();
+ tip.style.left=Math.min(ev.clientX-box.left+14,box.width-245)+'px';
+ tip.style.top=Math.max(8,ev.clientY-box.top-20)+'px';
+}
+function countryUrl(f){
+ const iso = f.properties.iso3;
+ if(!/^[A-Z]{3}$/.test(iso)) return null;
+ return '/news_feed?country='+encodeURIComponent(iso);
+}
+function goCountry(f){
+ const url=countryUrl(f);if(!url)return;
+ // A top-level navigation preserves the existing Streamlit page URL convention.
+ const a=document.createElement('a');a.href=url;a.target='_top';a.rel='noopener';
+ document.body.appendChild(a);a.click();a.remove();
+}
+if(typeof Globe==='undefined'){
+ status.textContent='The 3D globe library could not load. Check internet access or select Classic Map.';
+}else{
+ try{
+ const globe=Globe()(el)
+   .backgroundColor('#07101e')
+   .globeImageUrl('https://unpkg.com/three-globe@2.45.0/example/img/earth-blue-marble.jpg')
+   .bumpImageUrl('https://unpkg.com/three-globe@2.45.0/example/img/earth-topology.png')
+   .showAtmosphere(true).atmosphereColor('#4a8bc5').atmosphereAltitude(.16)
+   .polygonsData(geo.features)
+   .polygonCapColor(f=>shade(Number(f.properties.news_count)||0))
+   .polygonSideColor(()=> 'rgba(17,40,60,.55)')
+   .polygonStrokeColor(()=> 'rgba(169,197,223,.48)')
+   .polygonAltitude(f=>f.properties.news_count>0?.014:.003)
+   .onPolygonHover((f,prev)=>{el.style.cursor=f?'pointer':'grab';})
+   .polygonLabel(f=>`<div style="padding:7px 10px;background:#0b1929;color:white;border-radius:8px;border:1px solid #54728a"><b>${String(f.properties.name||'').replace(/[&<>"']/g,'')}</b><div>${Number(f.properties.news_count)||0} matching articles</div><small>Click to open News Feed</small></div>`)
+   .onPolygonClick(goCountry);
+ globe.pointOfView({lat:23,lng:0,altitude:2.25},0);
+ globe.controls().autoRotate=true;
+ globe.controls().autoRotateSpeed=.24;
+ globe.controls().enableDamping=true;
+ const stopRotate=()=>{globe.controls().autoRotate=false;};
+ el.addEventListener('pointerdown',stopRotate,{once:true});
+ el.addEventListener('wheel',stopRotate,{once:true});
+ function resize(){globe.width(el.clientWidth).height(660)}
+ window.addEventListener('resize',resize);resize();
+ // Keep country labels at zoomed-in scales, avoiding world-view clutter.
+ function updateLabels(){
+   const altitude=globe.pointOfView().altitude;
+   const visible=labels.filter(p=>altitude<1.5 && (p.tier==='label-large'||altitude<.9 && p.tier==='label-medium'||altitude<.48));
+   globe.htmlElementsData(visible)
+     .htmlLat(p=>p.lat).htmlLng(p=>p.lng).htmlAltitude(.025)
+     .htmlElement(p=>{const e=document.createElement('div');e.className='country-label';e.textContent=p.name;return e;});
+ }
+ let previous=Infinity;
+ globe.controls().addEventListener('change',()=>{
+   const alt=globe.pointOfView().altitude;
+   const bucket=alt<.48?3:alt<.9?2:alt<1.5?1:0;
+   if(bucket!==previous){previous=bucket;updateLabels();}
+ });
+ status.remove();
+ }catch(e){status.textContent='Globe initialization failed: '+e.message;}
+}
+</script></body></html>"""
+    html_doc = (html_doc.replace("__GEO__", payload)
+                        .replace("__LABELS__", labels)
+                        .replace("__TOPIC__", topic))
+    components.html(html_doc, height=665, scrolling=False)
+
+
+if view_mode == "3D Globe":
+    render_news_globe(world_geojson, country_metrics, selected_topic_label)
+    st.caption("3D globe uses externally hosted JavaScript and Earth textures. Click a country to open its feed. Select Classic Map if the globe cannot load.")
+    st.stop()
+
+
 # Inject active counts directly into GeoJSON layer properties for native Popups
 for feature in world_geojson['features']:
     iso_3 = feature['id']
@@ -307,16 +500,16 @@ for feature in world_geojson['features']:
         html_popup = f"""
         <div style="font-family: Arial, sans-serif; font-size: 12px; width: 160px;">
             <h4 style="margin:0 0 5px 0;">{country_name}</h4>
-            <p style="margin:0 0 10px 0;"><b>{count} updates today.</b></p>
+            <p style="margin:0 0 10px 0;"><b>{count} {selected_topic_label.lower()} updates (24h).</b></p>
            <a href="/news_feed?country={iso_3}" target="_blank" style="color: #ff4b4b; font-weight: bold; text-decoration: none;"> ➡️ Open News Feed </a>
         </div>
         """
         feature['properties']['popup_html'] = html_popup
     else:
-        feature['properties']['popup_html'] = f"<h4>{country_name}</h4><p>No new updates in past 24 hours.</p>"
+        feature['properties']['popup_html'] = f"<h4>{country_name}</h4><p>No matching updates in past 24 hours.</p>"
 
 # 1. Define the CARTO Voyager configuration base layer (Using no labels so they don't clash)
-VOYAGER_NO_LABELS = "https://{s}://{z}/{x}/{y}{r}.png"
+VOYAGER_NO_LABELS = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png"
 VOYAGER_ATTR = '&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
 
 m = folium.Map(
@@ -383,7 +576,7 @@ folium.Choropleth(
     fill_color="YlOrRd",
     fill_opacity=0.6,
     line_opacity=0.2,
-    legend_name="Intelligence Updates (Past 24 Hours Only)",
+    legend_name=f"{selected_topic_label} — Updates (Past 24 Hours)",
     nan_fill_color="#eeeeee"
 ).add_to(m)
 
@@ -392,7 +585,7 @@ folium.Choropleth(
 folium.GeoJson(
     world_geojson,
     style_function=lambda x: {'fillOpacity': 0.0, 'color': 'transparent'},
-    tooltip=folium.GeoJsonTooltip(fields=['name', 'news_count'], aliases=['Country:', '24h Briefs:']),
+    tooltip=folium.GeoJsonTooltip(fields=['name', 'news_count'], aliases=['Country:', 'Matching 24h articles:']),
     popup=folium.GeoJsonPopup(fields=['popup_html'], labels=False)
 ).add_to(m)
 
@@ -457,4 +650,4 @@ m.add_child(CountryLabelController())
 
 
 
-st_folium(m, width="100%", height=600)
+st_folium(m, width="100%", height=600, key=f"world_map_{selected_topic or 'all'}")
